@@ -1,1 +1,438 @@
-reyijjjbb
+import os
+import asyncio
+import datetime
+import subprocess
+import time
+import random
+import glob
+import shlex
+import re
+from telethon import TelegramClient, events
+from telethon.tl.types import DocumentAttributeVideo
+from telethon.errors import FloodWaitError
+from dotenv import load_dotenv
+
+# --- CONFIGURATION ---
+load_dotenv()
+API_ID = int(os.getenv("API_ID"))
+# FIX: Removed extra ')' from the lines below
+API_HASH = os.getenv("API_HASH")
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+DUMP_CHANNEL_ID = int(os.getenv("DUMP_CHANNEL_ID"))
+ADMINS_STR = os.getenv("PERMANENT_ADMINS", "")
+PERMANENT_ADMINS = {int(admin_id) for admin_id in ADMINS_STR.split()}
+
+# --- MAIN CONFIGURATION ---
+# TESTING: "100MB" | PRODUCTION: "1.95GB"
+AUTO_SPLIT_THRESHOLD = "1.95GB"
+
+# --- INITIALIZATION ---
+client = TelegramClient("recordbot", API_ID, API_HASH)
+active_processes = {}
+approved_users = set(PERMANENT_ADMINS)
+
+# --- HELPER FUNCTIONS ---
+def sanitize_filename(text):
+    return re.sub(r'[\\/*?:"<>|]', "", text).strip()
+
+def time_to_seconds(t):
+    if not t: return None
+    try:
+        # Remove any extra colons and clean the time string
+        t = re.sub(r':+', ':', t.strip())
+        
+        if ":" in t:
+            # Split and filter out empty strings
+            parts = [int(p) for p in t.split(":") if p]
+            if len(parts) == 3:  # HH:MM:SS
+                return parts[0] * 3600 + parts[1] * 60 + parts[2]
+            elif len(parts) == 2:  # MM:SS
+                return parts[0] * 60 + parts[1]
+            elif len(parts) == 1:  # SS
+                return parts[0]
+        elif t.isdigit():
+            return int(t)
+        raise ValueError(f"Invalid time format: {t}")
+    except (ValueError, IndexError) as e:
+        print(f"⚠️ Error parsing time '{t}': {str(e)}")
+        return None
+
+def parse_size_to_bytes(size_str):
+    size_str = size_str.upper()
+    if "GB" in size_str: return int(float(size_str.replace("GB", "")) * 1024**3)
+    if "MB" in size_str: return int(float(size_str.replace("MB", "")) * 1024**2)
+    return int(size_str)
+
+AUTO_SPLIT_SIZE_BYTES = parse_size_to_bytes(AUTO_SPLIT_THRESHOLD)
+
+def parse_delay_to_seconds(delay_str):
+    total_seconds = 0
+    time_map = {'h': 3600, 'm': 60, 's': 1}
+    current_number = ""
+    for char in delay_str.lower():
+        if char.isdigit(): current_number += char
+        elif char in time_map and current_number:
+            total_seconds += int(current_number) * time_map[char]
+            current_number = ""
+    return total_seconds
+
+def readable_size(size_bytes):
+    if size_bytes == 0: return "0 B"
+    for unit in ["B", "KB", "MB", "GB", "TB"]:
+        if size_bytes < 1024: return f"{size_bytes:.2f} {unit}"
+        size_bytes /= 1024
+    return f"{size_bytes:.2f} TB"
+
+async def get_video_metadata(filepath):
+    try:
+        probe_cmd = ["ffprobe", "-v", "error", "-show_entries", "stream=width,height,duration,bit_rate", "-of", "default=noprint_wrappers=1:nokey=1", filepath]
+        p = await asyncio.create_subprocess_exec(*probe_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        stdout, _ = await p.communicate()
+        output = [line for line in stdout.decode().strip().split('\n') if line]
+        duration = float(next((line for line in output if '.' in line), '0'))
+        width = int(next((line for line in output if line.isdigit() and 100 < int(line) < 8000), '1280'))
+        height = int(next((line for line in output if line.isdigit() and 100 < int(line) != width), '720'))
+        bitrate = int(next((line for line in output if line.isdigit() and int(line) > 10000), '4000000'))
+        return duration, width, height, bitrate
+    except: return 0, 1280, 720, 4000000
+
+async def generate_thumbnail(filepath, duration):
+    thumb = f"{filepath}.jpg"
+    cmd = ["ffmpeg", "-ss", str(int(duration * 0.1)), "-i", filepath, "-vframes", "1", "-q:v", "5", "-y", thumb]
+    p = await asyncio.create_subprocess_exec(*cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    await p.wait()
+    return thumb if os.path.exists(thumb) else None
+
+def terminal_upload_progress(current, total):
+    print(f"🔼 UPLOADING: {readable_size(current)} / {readable_size(total)} ({current/total:.1%})")
+
+# --- CORE LOGIC ---
+async def upload_file(chat_id, filepath, title, part_num=None, total_parts=None):
+    thumb = None
+    retries = 3  # Number of upload retries
+    
+    try:
+        # Verify file integrity before uploading
+        if not os.path.exists(filepath):
+            raise FileNotFoundError(f"File not found: {filepath}")
+        
+        file_size = os.path.getsize(filepath)
+        if file_size < 1000:
+            raise ValueError(f"File too small ({file_size} bytes), likely corrupted")
+            
+        part_str = f"(Live Part {part_num})" if part_num and not total_parts else f"(Part {part_num}/{total_parts})" if part_num and total_parts and total_parts > 1 else ""
+        final_title = f"{title} {part_str}".strip()
+        
+        # Get video metadata with retry
+        for attempt in range(3):
+            try:
+                duration, width, height, _ = await get_video_metadata(filepath)
+                if duration > 0 and width > 0 and height > 0:
+                    break
+            except Exception as e:
+                if attempt == 2:
+                    print(f"⚠️ Metadata extraction failed: {e}")
+                    duration, width, height = 0, 1280, 720
+                await asyncio.sleep(1)
+        
+        caption = (
+            f"🎬 <b>{final_title}</b>\n\n"
+            f"✨ <i>Recording successfully captured and uploaded.</i>\n\n"
+            f"<b><u>Video Details:</u></b>\n"
+            f"📁 <b>File Name:</b> <code>{os.path.basename(filepath)}</code>\n"
+            f"⏱ <b>Duration:</b> <code>{str(datetime.timedelta(seconds=int(duration)))}</code>\n"
+            f"📦 <b>File Size:</b> <code>{readable_size(file_size)}</code>\n"
+            f"🖥 <b>Resolution:</b> <code>{width}x{height}</code>"
+        )
+        
+        if duration > 0:
+            thumb = await generate_thumbnail(filepath, duration)
+
+        print(f"📤 [UPLOAD START] '{os.path.basename(filepath)}' ({readable_size(file_size)})")
+        
+        # Upload with retries
+        for attempt in range(retries):
+            try:
+                dump = await client.send_file(
+                    DUMP_CHANNEL_ID, filepath, caption=caption, parse_mode="html", thumb=thumb,
+                    attributes=[DocumentAttributeVideo(duration=int(duration), w=width, h=height, supports_streaming=True)],
+                    progress_callback=terminal_upload_progress
+                )
+                await client.send_file(chat_id, file=dump.media, caption=caption, parse_mode="html")
+                print(f"✅ [UPLOAD SUCCESS] '{os.path.basename(filepath)}' sent to chat {chat_id}")
+                break
+            except FloodWaitError as e:
+                if attempt < retries - 1:
+                    wait_time = e.seconds + 5
+                    print(f"⏳ Rate limited, waiting {wait_time}s before retry {attempt + 1}/{retries}")
+                    await asyncio.sleep(wait_time)
+                else:
+                    raise
+            except Exception as e:
+                if attempt < retries - 1:
+                    print(f"⚠️ Upload attempt {attempt + 1}/{retries} failed: {str(e)}")
+                    await asyncio.sleep(5)
+                else:
+                    raise
+                    
+    except Exception as e:
+        error_msg = f"❌ **Upload Failed!**\n\n<b>File:</b> <code>{os.path.basename(filepath)}</code>\n<b>Error:</b> <code>{str(e)}</code>"
+        print(f"⚠️ [UPLOAD FAILED] {str(e)}")
+        await client.send_message(chat_id, error_msg, parse_mode="html")
+        return False
+    finally:
+        if os.path.exists(filepath): os.remove(filepath)
+        if thumb and os.path.exists(thumb): os.remove(thumb)
+    
+    return True
+
+async def split_file_by_size(chat_id, original_path, title):
+    print(f"🔄 Starting file split process for {original_path}")
+    total_duration = 0
+    avg_bitrate = 0
+    
+    try:
+        total_duration, _, _, avg_bitrate = await get_video_metadata(original_path)
+    except Exception as e:
+        print(f"⚠️ Error getting video metadata: {e}. Using default values.")
+    
+    if total_duration == 0 or avg_bitrate == 0:
+        print("⚠️ Could not get video metadata for splitting. Using default values.")
+        # Use conservative defaults if metadata extraction fails
+        total_duration = os.path.getsize(original_path) / (4 * 1024 * 1024)  # Assume 4MB/s
+        avg_bitrate = 4 * 1024 * 1024 * 8  # Assume 4MB/s in bits
+
+    # Calculate split duration with some margin for safety
+    split_duration_seconds = max(300, int((AUTO_SPLIT_SIZE_BYTES * 7) / (avg_bitrate)))  # Min 5 minutes, 70% of theoretical max
+    parts_to_upload, current_pos = [], 0
+    
+    print(f"📊 Split configuration: Duration={total_duration}s, Bitrate={avg_bitrate/1024/1024:.1f}Mbps, Split size={split_duration_seconds}s")
+    
+    while current_pos < total_duration:
+        try:
+            part_num = len(parts_to_upload) + 1
+            part_path = f"split_{int(time.time())}_part{part_num}.mp4"
+            
+            # More robust splitting command with error checking
+            cmd = [
+                "ffmpeg", "-y", 
+                "-ss", str(current_pos),
+                "-i", original_path,
+                "-t", str(split_duration_seconds),
+                "-c", "copy",
+                "-avoid_negative_ts", "1",
+                "-reset_timestamps", "1",
+                part_path
+            ]
+            
+            p = await asyncio.create_subprocess_exec(*cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            stdout, stderr = await p.communicate()
+            
+            if p.returncode == 0 and os.path.exists(part_path) and os.path.getsize(part_path) > 1000:
+                print(f"✅ Successfully split part {part_num}")
+                parts_to_upload.append(part_path)
+                part_dur, _, _, _ = await get_video_metadata(part_path)
+                if part_dur > 0:
+                    current_pos += part_dur
+                    print(f"📊 Part {part_num} duration: {part_dur}s, Total progress: {current_pos}/{total_duration}s")
+                else:
+                    print(f"⚠️ Could not get duration for part {part_num}, using split duration")
+                    current_pos += split_duration_seconds
+            else:
+                print(f"❌ Failed to split part {part_num}: {stderr.decode()}")
+                if os.path.exists(part_path): os.remove(part_path)
+                break
+        except Exception as e:
+            print(f"❌ Error splitting part {part_num}: {str(e)}")
+            if os.path.exists(part_path): os.remove(part_path)
+            break
+    
+    if not parts_to_upload:
+        await client.send_message(chat_id, "⚠️ Splitting failed. Attempting to upload original file.")
+        if os.path.exists(original_path): await upload_file(chat_id, original_path, title)
+    else:
+        for i, part in enumerate(parts_to_upload):
+            await upload_file(chat_id, part, title, i + 1, len(parts_to_upload))
+        if os.path.exists(original_path): os.remove(original_path)
+
+async def handle_recorded_file(chat_id, filepath, title):
+    if not os.path.exists(filepath) or os.path.getsize(filepath) < 1000:
+        print(f"❌ [RECORDING FAILED] Output file '{filepath}' is missing or empty.")
+        return
+
+    file_size = os.path.getsize(filepath)
+    if file_size > AUTO_SPLIT_SIZE_BYTES:
+        await client.send_message(chat_id, f"ℹ️ File size is `{readable_size(file_size)}`. Automatically splitting into `{AUTO_SPLIT_THRESHOLD}` parts...")
+        await split_file_by_size(chat_id, filepath, title)
+    else:
+        await upload_file(chat_id, filepath, title)
+
+async def record_stream(chat_id, task_id, url, title, duration_str=None, split_duration_str=None):
+    duration = time_to_seconds(duration_str)
+    split_seconds = time_to_seconds(split_duration_str)
+    safe_title = sanitize_filename(title)
+    base_filename = f"{safe_title}_{task_id}"
+    
+    start_msg = (
+        f"━━━━━━━━━━ <b>New Recording</b> ━━━━━━━━━━\n\n"
+        f"🎬 <b>Title:</b> {title}\n"
+        f"🔗 <b>Source:</b> <code>{url}</code>\n"
+        f"⏱ <b>Duration:</b> {'∞' if not duration else str(datetime.timedelta(seconds=duration))}\n"
+        f"📑 <b>Task ID:</b> <code>{task_id}</code>\n\n"
+        f"⚙️ <b>Configuration:</b>\n"
+        f"{'├' if split_seconds else '└'}  Auto-Split: {'✅' if split_seconds else '❌'}\n"
+        f"{'└  Split Interval: '+str(datetime.timedelta(seconds=split_seconds)) if split_seconds else ''}"
+    )
+    
+    msg = await client.send_message(chat_id, f"{start_msg}\n\n⏳ <i>Initializing stream...</i>", parse_mode="html")
+    
+    # Enhanced FFmpeg command with better error handling and reconnection
+    cmd = [
+        "ffmpeg",
+        "-user_agent", "Mozilla/5.0",
+        "-reconnect", "1",
+        "-reconnect_streamed", "1",
+        "-reconnect_delay_max", "5",  # Maximum delay between reconnection attempts
+        "-y",
+        "-i", url,
+        "-c", "copy",
+        "-bsf:a", "aac_adtstoasc",
+        "-movflags", "+faststart",  # Optimize for streaming
+        "-progress", "pipe:1"  # Output progress to stdout
+    ]
+    
+    if duration: cmd.extend(["-t", str(duration)])
+    if split_seconds:
+        cmd.extend(["-f", "segment", "-segment_time", str(split_seconds), "-reset_timestamps", "1", f"{base_filename}_part_%03d.mp4"])
+    else:
+        cmd.append(f"{base_filename}.mp4")
+
+    p = await asyncio.create_subprocess_exec(*cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    active_processes[task_id] = p
+    
+    # Function to terminate recording
+    async def terminate_recording():
+        print("⏹️ Terminating ffmpeg process...")
+        if p.returncode is None:
+            p.terminate()
+            await asyncio.sleep(2)  # Give ffmpeg time to cleanup
+            if p.returncode is None:
+                p.kill()  # Force kill if still running
+        return
+    
+    start_time, last_update, last_upload_check = time.time(), 0, 0
+    uploaded_parts = set()
+    try:
+        while p.returncode is None:
+            await asyncio.sleep(1)
+            elapsed = int(time.time() - start_time)
+            
+            # --- CONCURRENT UPLOAD LOGIC ---
+            if split_seconds and time.time() - last_upload_check > 10: # Check for new parts every 10 seconds
+                current_parts = sorted(glob.glob(f"{base_filename}_part_*.mp4"))
+                for part_path in current_parts:
+                    # Ensure file is not being written to by checking if it's the latest one
+                    if part_path not in uploaded_parts and part_path != current_parts[-1]:
+                        print(f"[*] Live Split: Detected new part '{part_path}'. Uploading in background...")
+                        uploaded_parts.add(part_path)
+                        part_num_match = re.search(r'_part_(\d+)\.mp4', part_path)
+                        part_num = int(part_num_match.group(1)) if part_num_match else len(uploaded_parts)
+                        asyncio.create_task(upload_file(chat_id, part_path, title, part_num))
+                last_upload_check = time.time()
+
+            # Strict duration check
+            if duration and elapsed >= duration:
+                print(f"⏹️ Duration limit reached ({duration}s). Stopping recording...")
+                if p.returncode is None:
+                    p.terminate()
+                    await asyncio.sleep(2)  # Give ffmpeg time to cleanup
+                break
+                
+            if time.time() - last_update > 6:
+                elapsed_str = str(datetime.timedelta(seconds=elapsed))
+                progress_text = ""
+                # Calculate file size
+                if os.path.exists(f"{base_filename}.mp4"):
+                    current_size = readable_size(os.path.getsize(f"{base_filename}.mp4"))
+                else:
+                    current_size = "0 B"
+
+                if duration:
+                    percent = min(100, (elapsed / duration) * 100)
+                    blocks = "█" * int(percent // 5) + "░" * (20 - int(percent // 5))  # 20 blocks for more granular progress
+                    time_remaining = str(datetime.timedelta(seconds=max(0, duration - elapsed)))
+                    
+                    progress_text = (
+                        f"━━━━━━━━━━ <b>Recording Status</b> ━━━━━━━━━━\n\n"
+                        f"<code>[{blocks}]</code> {percent:.1f}%\n\n"
+                        f"⏱ <b>Elapsed:</b> {elapsed_str}\n"
+                        f"⌛️ <b>Remaining:</b> {time_remaining}\n"
+                        f"📦 <b>Size:</b> {current_size}\n"
+                        f"🎯 <b>Target:</b> {str(datetime.timedelta(seconds=duration))}"
+                    )
+                    print(f"🔴 REC: {title} | {percent:.1f}% [{blocks}] {elapsed_str}/{str(datetime.timedelta(seconds=duration))} | {current_size}")
+                else:
+                    blocks = "▰" * (elapsed % 20 + 1) + "▱" * (19 - (elapsed % 20))  # Animated progress for unlimited
+                    progress_text = (
+                        f"━━━━━━━━━━ <b>Recording Status</b> ━━━━━━━━━━\n\n"
+                        f"<code>[{blocks}]</code> Live\n\n"
+                        f"⏱ <b>Duration:</b> {elapsed_str}\n"
+                        f"📦 <b>Size:</b> {current_size}\n"
+                        f"🔄 <b>Status:</b> Recording..."
+                    )
+                    print(f"🔴 REC: {title} | ∞ {elapsed_str} | {current_size}")
+                
+                try:
+                    status_msg = (
+                        f"🎬 <b>{title}</b>\n\n"
+                        f"{progress_text}\n\n"
+                        f"ℹ️ <b>Task ID:</b> <code>{task_id}</code>"
+                    )
+                    await msg.edit(status_msg, parse_mode="html")
+                except Exception as e:
+                    print(f"⚠️ Could not update status: {str(e)}")
+                last_update = time.time()
+    finally:
+        await p.wait()
+        if task_id in active_processes: del active_processes[task_id]
+
+    await msg.edit(f"✅ **Recording Complete!**\n\n📤 <i>Processing final files...</i>")
+    
+    # Final check for all remaining parts
+    if split_seconds:
+        # Wait briefly to ensure ffmpeg fully closed the last file
+        await asyncio.sleep(2)
+        final_parts = sorted(glob.glob(f"{base_filename}_part_*.mp4"))
+        for part_path in final_parts:
+            if part_path not in uploaded_parts:
+                part_num_match = re.search(r'_part_(\d+)\.mp4', part_path)
+                part_num = int(part_num_match.group(1)) if part_num_match else len(uploaded_parts) + 1
+                await upload_file(chat_id, part_path, title, part_num)
+                uploaded_parts.add(part_path)
+    else:
+        single_file = f"{base_filename}.mp4"
+        await handle_recorded_file(chat_id, single_file, title)
+    
+    await msg.delete()
+
+# --- COMMAND HANDLERS ---
+@client.on(events.NewMessage(pattern=r"^/record"))
+async def record_cmd(event):
+    if event.sender_id not in approved_users: return await event.reply("🚫 **Access Denied!**")
+    try:
+        args = shlex.split(event.text)
+        if len(args) < 3: raise ValueError("Not enough arguments")
+
+        url = args[1]
+        title, duration, split_duration = None, None, None
+
+        if "--split" in args:
+            split_index = args.index("--split")
+            if len(args) > split_index + 1:
+                split_duration = args[split_index + 1]
+                # Validate split duration
+                if time_to_seconds(split_duration) is None:
+                    return await event.reply(f"❌ **Invalid split duration format:** `{split_duration}`\nUse format: HH:MM:SS or MM:SS")
+                args.pop(split_index + 1)
+                args.pop(split_index)
+            else: raise ValueError("-
