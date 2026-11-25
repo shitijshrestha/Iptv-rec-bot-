@@ -1,754 +1,260 @@
 
 import os
-import re
-import glob
-import shlex
-import html
-import time
 import asyncio
-import logging
 import datetime
 import subprocess
 
-from telethon import TelegramClient, events
-from telethon.tl.types import DocumentAttributeVideo
-from telethon.errors import FloodWaitError
-from dotenv import load_dotenv
+from pyrogram import Client, filters
+from pyrogram.types import Message
+from pyrogram.errors import FloodWait
 
 
-# =========================================================
-# CONFIGURATION
-# =========================================================
+# ---------------- CONFIG (ENV) ----------------
 
-load_dotenv()
+API_ID = int(os.getenv("API_ID", "0"))
+API_HASH = os.getenv("API_HASH", "")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 
-def get_env(name, required=True, default=None):
-    value = os.getenv(name, default)
-    if required and not value:
-        raise ValueError(f"Missing environment variable: {name}")
-    return value
+PERMANENT_ADMIN = int(os.getenv("PERMANENT_ADMIN", "0"))
+DUMP_CHANNEL_ID = int(os.getenv("DUMP_CHANNEL_ID", "0"))
 
 
-API_ID = int(get_env("API_ID"))
-API_HASH = get_env("API_HASH")
-BOT_TOKEN = get_env("BOT_TOKEN")
-DUMP_CHANNEL_ID = int(get_env("DUMP_CHANNEL_ID"))
-
-PERMANENT_ADMINS = {
-    int(x.strip())
-    for x in get_env("PERMANENT_ADMINS", False, "").split(",")
-    if x.strip()
-}
-
-MAX_FILE_SIZE = int(1.95 * 1024 * 1024 * 1024)
-MIN_FILE_SIZE = 1000
-UPLOAD_RETRIES = 3
-RECORD_DIR = "recordings"
-
-FFMPEG = get_env("FFMPEG_PATH", False, "ffmpeg")
-FFPROBE = get_env("FFPROBE_PATH", False, "ffprobe")
-
-os.makedirs(RECORD_DIR, exist_ok=True)
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s"
+app = Client(
+    "recordbot",
+    api_id=API_ID,
+    api_hash=API_HASH,
+    bot_token=BOT_TOKEN
 )
-logger = logging.getLogger(__name__)
 
-client = TelegramClient("recording_bot", API_ID, API_HASH)
-
-recording_tasks = {}
+approved_users = {PERMANENT_ADMIN}
 active_processes = {}
+last_recording = {}
 
 
-# =========================================================
-# HELPERS
-# =========================================================
+# ---------------- HELPERS ----------------
 
-def is_admin(user_id):
-    return user_id in PERMANENT_ADMINS
+def time_to_seconds(t):
+    parts = list(map(int, t.split(":")))
 
+    if len(parts) == 3:
+        h, m, s = parts
+    elif len(parts) == 2:
+        h, m, s = 0, parts[0], parts[1]
+    else:
+        h, m, s = 0, 0, parts[0]
 
-def safe_filename(name):
-    name = re.sub(r'[\\/:*?"<>|]+', "_", name)
-    name = re.sub(r"\s+", " ", name).strip()
-    return name[:100] or "Recording"
+    return h * 3600 + m * 60 + s
 
 
 def readable_size(size):
-    size = float(size)
-    for unit in ("B", "KB", "MB", "GB", "TB"):
+    for unit in ["B", "KB", "MB", "GB"]:
         if size < 1024:
             return f"{size:.2f} {unit}"
         size /= 1024
-    return f"{size:.2f} PB"
+
+    return f"{size:.2f} TB"
 
 
-def parse_time(value):
-    """
-    Supports:
-    3600
-    01:00
-    01:00:00
-    """
-    value = value.strip()
+# ---------------- UPLOAD ----------------
 
-    if value.isdigit():
-        return int(value)
-
-    parts = value.split(":")
-    if not all(part.isdigit() for part in parts):
-        raise ValueError("Invalid time format")
-
-    parts = [int(part) for part in parts]
-
-    if len(parts) == 2:
-        minutes, seconds = parts
-        return minutes * 60 + seconds
-
-    if len(parts) == 3:
-        hours, minutes, seconds = parts
-        return hours * 3600 + minutes * 60 + seconds
-
-    raise ValueError("Use HH:MM:SS or seconds")
-
-
-def format_time(seconds):
-    seconds = max(0, int(seconds))
-    return str(datetime.timedelta(seconds=seconds))
-
-
-async def run_command(*args):
-    process = await asyncio.create_subprocess_exec(
-        *args,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE
-    )
-    stdout, stderr = await process.communicate()
-
-    if process.returncode != 0:
-        raise RuntimeError(
-            stderr.decode(errors="ignore")[-3000:]
+async def upload_video(chat_id, filepath):
+    try:
+        duration = float(
+            subprocess.check_output([
+                "ffprobe",
+                "-v", "error",
+                "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                filepath
+            ]).decode().strip()
         )
+    except Exception:
+        duration = 0
 
-    return stdout.decode(errors="ignore")
+    size = os.path.getsize(filepath)
 
-
-async def get_duration(path):
-    output = await run_command(
-        FFPROBE,
-        "-v", "error",
-        "-show_entries", "format=duration",
-        "-of", "default=noprint_wrappers=1:nokey=1",
-        path
+    caption = (
+        f"📁 <b>File:</b> {os.path.basename(filepath)}\n"
+        f"⏱ <b>Duration:</b> "
+        f"{str(datetime.timedelta(seconds=int(duration)))}\n"
+        f"📦 <b>Size:</b> {readable_size(size)}"
     )
 
     try:
-        return float(output.strip())
-    except (ValueError, TypeError):
-        return 0.0
-
-
-async def get_bitrate(path):
-    output = await run_command(
-        FFPROBE,
-        "-v", "error",
-        "-show_entries", "format=bit_rate",
-        "-of", "default=noprint_wrappers=1:nokey=1",
-        path
-    )
-
-    try:
-        return int(output.strip())
-    except (ValueError, TypeError):
-        return 0
-
-
-async def make_thumbnail(video_path):
-    thumb_path = video_path + ".jpg"
-
-    try:
-        await run_command(
-            FFMPEG,
-            "-y",
-            "-ss", "00:00:05",
-            "-i", video_path,
-            "-frames:v", "1",
-            "-vf", "scale=320:-1",
-            thumb_path
-        )
-
-        if os.path.exists(thumb_path):
-            return thumb_path
-
-    except Exception as error:
-        logger.warning("Thumbnail creation failed: %s", error)
-
-    return None
-
-
-def video_attributes(duration):
-    return [
-        DocumentAttributeVideo(
-            duration=max(1, int(duration)),
-            w=1280,
-            h=720,
+        await app.send_video(
+            chat_id,
+            filepath,
+            caption=caption,
             supports_streaming=True
         )
-    ]
 
-
-async def safe_edit(message, text):
-    try:
-        await message.edit(text)
-    except Exception:
-        pass
-
-
-# =========================================================
-# PROGRESS
-# =========================================================
-
-async def upload_progress(current, total, status_message, started):
-    if not total:
-        return
-
-    now = time.time()
-
-    if current != total and now - upload_progress.last_update < 3:
-        return
-
-    upload_progress.last_update = now
-
-    percent = current * 100 / total
-    elapsed = max(1, now - started)
-    speed = current / elapsed
-    remaining = (total - current) / speed if speed else 0
-
-    text = (
-        "📤 <b>Uploading...</b>\n\n"
-        f"Progress: <b>{percent:.1f}%</b>\n"
-        f"Uploaded: {readable_size(current)} / {readable_size(total)}\n"
-        f"Speed: {readable_size(speed)}/s\n"
-        f"ETA: {format_time(remaining)}"
-    )
-
-    await safe_edit(status_message, text)
-
-
-upload_progress.last_update = 0
-
-
-# =========================================================
-# RECORDING
-# =========================================================
-
-async def record_stream(url, output_path, duration, task_id, status_message):
-    command = [
-        FFMPEG,
-        "-y",
-        "-hide_banner",
-        "-loglevel", "error",
-        "-i", url,
-        "-map", "0",
-        "-c", "copy",
-        "-t", str(duration),
-        "-movflags", "+faststart",
-        output_path
-    ]
-
-    process = await asyncio.create_subprocess_exec(
-        *command,
-        stdout=asyncio.subprocess.DEVNULL,
-        stderr=asyncio.subprocess.PIPE
-    )
-
-    active_processes[task_id] = process
-    started = time.time()
-
-    try:
-        while process.returncode is None:
-            if process.returncode is not None:
-                break
-
-            await asyncio.sleep(5)
-
-            elapsed = int(time.time() - started)
-            await safe_edit(
-                status_message,
-                "🔴 <b>Recording in progress</b>\n\n"
-                f"Elapsed: <b>{format_time(elapsed)}</b>\n"
-                f"Target: <b>{format_time(duration)}</b>\n"
-                f"File: <code>{html.escape(os.path.basename(output_path))}</code>"
-            )
-
-            if process.returncode is not None:
-                break
-
-        await process.wait()
-
-        if process.returncode != 0:
-            error = await process.stderr.read()
-            raise RuntimeError(
-                error.decode(errors="ignore")[-2500:]
-            )
-
-        if not os.path.exists(output_path):
-            raise RuntimeError("Recording file was not created")
-
-        if os.path.getsize(output_path) < MIN_FILE_SIZE:
-            raise RuntimeError("Recording file is empty or too small")
-
-    except asyncio.CancelledError:
-        if process.returncode is None:
-            process.kill()
-            await process.wait()
-        raise
-
-    finally:
-        active_processes.pop(task_id, None)
-
-
-# =========================================================
-# FILE SPLITTING
-# =========================================================
-
-async def split_file_by_duration(input_path, segment_seconds, base_name):
-    pattern = os.path.join(
-        RECORD_DIR,
-        f"{base_name}_part_%03d.mp4"
-    )
-
-    await run_command(
-        FFMPEG,
-        "-y",
-        "-hide_banner",
-        "-loglevel", "error",
-        "-i", input_path,
-        "-map", "0",
-        "-c", "copy",
-        "-f", "segment",
-        "-segment_time", str(max(60, int(segment_seconds))),
-        "-reset_timestamps", "1",
-        "-segment_format", "mp4",
-        pattern
-    )
-
-    return sorted(
-        glob.glob(
-            os.path.join(RECORD_DIR, f"{base_name}_part_*.mp4")
-        )
-    )
-
-
-async def prepare_upload_files(input_path, title, manual_split=None):
-    file_size = os.path.getsize(input_path)
-    duration = await get_duration(input_path)
-
-    if manual_split:
-        segment_seconds = manual_split
-    elif file_size > MAX_FILE_SIZE:
-        bitrate = await get_bitrate(input_path)
-
-        if bitrate > 0:
-            segment_seconds = int(
-                MAX_FILE_SIZE * 8 / bitrate * 0.85
-            )
-        elif duration > 0:
-            segment_seconds = int(
-                duration * MAX_FILE_SIZE / file_size * 0.80
-            )
-        else:
-            raise RuntimeError("Unable to calculate automatic split size")
-
-        segment_seconds = max(60, segment_seconds)
-    else:
-        return [input_path]
-
-    base_name = safe_filename(title)
-    parts = await split_file_by_duration(
-        input_path,
-        segment_seconds,
-        base_name
-    )
-
-    if not parts:
-        raise RuntimeError("FFmpeg could not split the recording")
-
-    # Check part sizes and split oversized parts again.
-    final_parts = []
-
-    for part in parts:
-        part_size = os.path.getsize(part)
-
-        if part_size <= MAX_FILE_SIZE:
-            final_parts.append(part)
-            continue
-
-        part_duration = await get_duration(part)
-
-        if part_duration <= 0:
-            raise RuntimeError(
-                f"Could not read duration of {os.path.basename(part)}"
-            )
-
-        smaller_seconds = max(
-            60,
-            int(part_duration * MAX_FILE_SIZE / part_size * 0.75)
-        )
-
-        sub_base = safe_filename(
-            os.path.basename(part).replace(".mp4", "_sub")
-        )
-
-        sub_parts = await split_file_by_duration(
-            part,
-            smaller_seconds,
-            sub_base
-        )
-
-        if not sub_parts:
-            raise RuntimeError("Second split attempt failed")
-
-        for sub_part in sub_parts:
-            if os.path.getsize(sub_part) > MAX_FILE_SIZE:
-                raise RuntimeError(
-                    "A split part is still larger than the upload limit"
-                )
-            final_parts.append(sub_part)
-
-        try:
-            os.remove(part)
-        except OSError:
-            pass
-
-    return final_parts
-
-
-# =========================================================
-# UPLOAD
-# =========================================================
-
-async def upload_one_file(path, title, part_number, total_parts, chat_id, status_message):
-    duration = await get_duration(path)
-    thumb_path = await make_thumbnail(path)
-
-    if total_parts > 1:
-        caption = (
-            f"<b>{html.escape(title)}</b>\n"
-            f"📁 Part {part_number}/{total_parts}\n"
-            "Powered by @ShitijRips"
-        )
-    else:
-        caption = (
-            f"<b>{html.escape(title)}</b>\n"
-            "Powered by @ShitijRips"
-        )
-
-    last_error = None
-
-    for attempt in range(1, UPLOAD_RETRIES + 1):
-        try:
-            upload_progress.last_update = 0
-            started = time.time()
-
-            await safe_edit(
-                status_message,
-                f"📤 <b>Uploading part {part_number}/{total_parts}</b>\n"
-                f"Size: {readable_size(os.path.getsize(path))}\n"
-                f"Attempt: {attempt}/{UPLOAD_RETRIES}"
-            )
-
-            sent = await client.send_file(
+        if DUMP_CHANNEL_ID != 0:
+            await app.send_video(
                 DUMP_CHANNEL_ID,
-                path,
+                filepath,
                 caption=caption,
-                thumb=thumb_path,
-                supports_streaming=True,
-                attributes=video_attributes(duration),
-                progress_callback=lambda current, total: asyncio.create_task(
-                    upload_progress(
-                        current,
-                        total,
-                        status_message,
-                        started
-                    )
-                )
+                supports_streaming=True
             )
 
-            # Copy the uploaded media from the dump channel to the user.
-            dump_message = sent[0] if isinstance(sent, list) else sent
-
-            await client.send_file(
-                chat_id,
-                dump_message.media,
-                caption=caption,
-                supports_streaming=True,
-                attributes=video_attributes(duration)
-            )
-
-            return
-
-        except FloodWaitError as error:
-            last_error = error
-            await asyncio.sleep(error.seconds + 2)
-
-        except Exception as error:
-            last_error = error
-            logger.exception("Upload attempt %s failed", attempt)
-
-            if attempt < UPLOAD_RETRIES:
-                await asyncio.sleep(5)
-
-    raise RuntimeError(f"Upload failed: {last_error}")
-
-    if thumb_path and os.path.exists(thumb_path):
-        os.remove(thumb_path)
-
-
-# =========================================================
-# COMPLETE RECORDING TASK
-# =========================================================
-
-async def run_recording(event, url, title, duration, manual_split=None):
-    task_id = event.sender_id
-    title = safe_filename(title)
-
-    output_path = os.path.join(
-        RECORD_DIR,
-        f"{title}_{int(time.time())}.mp4"
-    )
-
-    status_message = await event.reply(
-        "⏳ <b>Preparing recording...</b>"
-    )
-
-    try:
-        await record_stream(
-            url,
-            output_path,
-            duration,
-            task_id,
-            status_message
-        )
-
-        await safe_edit(
-            status_message,
-            "✅ <b>Recording completed!</b>\n"
-            f"Size: {readable_size(os.path.getsize(output_path))}\n"
-            "Preparing upload files..."
-        )
-
-        files_to_upload = await prepare_upload_files(
-            output_path,
-            title,
-            manual_split
-        )
-
-        total_parts = len(files_to_upload)
-
-        for index, file_path in enumerate(files_to_upload, start=1):
-            if task_id not in recording_tasks:
-                raise asyncio.CancelledError
-
-            await upload_one_file(
-                file_path,
-                title,
-                index,
-                total_parts,
-                event.chat_id,
-                status_message
-            )
-
-            try:
-                os.remove(file_path)
-            except OSError:
-                pass
-
-        await safe_edit(
-            status_message,
-            "🎉 <b>Recording and upload completed!</b>\n\n"
-            f"Title: <b>{html.escape(title)}</b>\n"
-            f"Parts uploaded: <b>{total_parts}</b>"
-        )
-
-    except asyncio.CancelledError:
-        await safe_edit(
-            status_message,
-            "🛑 <b>Recording cancelled.</b>"
-        )
-
-    except Exception as error:
-        logger.exception("Recording task failed")
-        await safe_edit(
-            status_message,
-            "❌ <b>Task failed</b>\n\n"
-            f"<code>{html.escape(str(error)[-2500:])}</code>"
-        )
+    except FloodWait as e:
+        await asyncio.sleep(e.value)
+        await upload_video(chat_id, filepath)
 
     finally:
-        active_processes.pop(task_id, None)
-        recording_tasks.pop(task_id, None)
-
-        for path in glob.glob(os.path.join(RECORD_DIR, "*")):
-            try:
-                if os.path.isfile(path):
-                    os.remove(path)
-            except OSError:
-                pass
+        if os.path.exists(filepath):
+            os.remove(filepath)
 
 
-# =========================================================
-# COMMANDS
-# =========================================================
+# ---------------- RECORD ----------------
 
-@client.on(events.NewMessage(pattern=r"^/start$"))
-async def start_handler(event):
-    await event.reply(
-        "👋 <b>Welcome to ShitijRips Recording Bot!</b>\n\n"
-        "Use /help to see commands."
+async def record_stream(chat_id, url, duration_str, title, msg: Message):
+    duration = time_to_seconds(duration_str)
+
+    start = datetime.datetime.now()
+
+    filename = (
+        f"{title.replace(' ', '_')}_"
+        f"{start.strftime('%Y%m%d_%H%M%S')}_"
+        f"{duration}s.mp4"
     )
 
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-i", url,
+        "-t", str(duration),
+        "-c:v", "libx264",
+        "-preset", "veryfast",
+        "-c:a", "aac",
+        "-b:a", "128k",
+        filename
+    ]
 
-@client.on(events.NewMessage(pattern=r"^/help$"))
-async def help_handler(event):
-    await event.reply(
-        "<b>🎬 Recording Bot Help</b>\n\n"
-        "<b>Start recording:</b>\n"
-        '<code>/record STREAM_URL "Show Name" 01:00:00</code>\n\n'
-        "<b>Manual split example:</b>\n"
-        '<code>/record STREAM_URL "Show Name" 02:00:00 --split 00:30:00</code>\n\n'
-        "<b>Other commands:</b>\n"
-        "<code>/tasks</code> - Show running task\n"
-        "<code>/stop</code> - Stop your recording\n"
-        "<code>/help</code> - Show help\n\n"
-        "Automatic splitting is enabled for large files."
+    process = subprocess.Popen(
+        cmd,
+        stderr=subprocess.PIPE
     )
 
+    active_processes[chat_id] = process
 
-@client.on(events.NewMessage(pattern=r"^/record(?:\s|$)"))
-async def record_handler(event):
-    if not is_admin(event.sender_id):
-        return await event.reply("⛔ You are not authorized.")
+    start_ts = datetime.datetime.now().timestamp()
 
-    if event.sender_id in recording_tasks:
-        return await event.reply(
-            "⚠️ You already have an active recording. Use /stop first."
+    while process.poll() is None:
+        elapsed = int(
+            datetime.datetime.now().timestamp() - start_ts
         )
 
-    raw = event.raw_text.strip()
+        percent = min(100, elapsed * 100 / duration)
 
-    # Expected:
-    # /record URL "Title" 01:00:00
-    # /record URL "Title" 02:00:00 --split 00:30:00
-
-    match = re.match(
-        r'^/record\s+(\S+)\s+"([^"]+)"\s+(\S+)'
-        r'(?:\s+--split\s+(\S+))?\s*$',
-        raw
-    )
-
-    if not match:
-        return await event.reply(
-            "❌ Invalid format.\n\n"
-            '<code>/record STREAM_URL "Show Name" 01:00:00</code>\n\n'
-            "Manual split:\n"
-            '<code>/record STREAM_URL "Show Name" 02:00:00 --split 00:30:00</code>'
+        bar = (
+            "█" * int(percent // 10)
+            + "░" * (10 - int(percent // 10))
         )
 
-    url, title, duration_text, split_text = match.groups()
-
-    try:
-        duration = parse_time(duration_text)
-
-        if duration <= 0:
-            raise ValueError("Duration must be greater than zero")
-
-        manual_split = (
-            parse_time(split_text) if split_text else None
-        )
-
-        if manual_split is not None and manual_split <= 0:
-            raise ValueError("Split duration must be greater than zero")
-
-    except ValueError as error:
-        return await event.reply(f"❌ {html.escape(str(error))}")
-
-    task = asyncio.create_task(
-        run_recording(
-            event,
-            url,
-            title,
-            duration,
-            manual_split
-        )
-    )
-
-    recording_tasks[event.sender_id] = task
-
-    await event.reply(
-        "✅ <b>Recording task started.</b>\n"
-        f"Title: <b>{html.escape(title)}</b>\n"
-        f"Duration: <b>{format_time(duration)}</b>"
-    )
-
-
-@client.on(events.NewMessage(pattern=r"^/tasks$"))
-async def tasks_handler(event):
-    if not is_admin(event.sender_id):
-        return await event.reply("⛔ You are not authorized.")
-
-    if not recording_tasks:
-        return await event.reply("No active recording tasks.")
-
-    lines = ["<b>📋 Active Tasks</b>\n"]
-
-    for user_id, task in recording_tasks.items():
-        status = "Running" if not task.done() else "Finished"
-        lines.append(f"• <code>{user_id}</code> - {status}")
-
-    await event.reply("\n".join(lines))
-
-
-@client.on(events.NewMessage(pattern=r"^/stop$"))
-async def stop_handler(event):
-    if not is_admin(event.sender_id):
-        return await event.reply("⛔ You are not authorized.")
-
-    task_id = event.sender_id
-    task = recording_tasks.get(task_id)
-
-    if not task:
-        return await event.reply("No active recording to stop.")
-
-    process = active_processes.get(task_id)
-
-    if process and process.returncode is None:
         try:
-            process.kill()
-        except ProcessLookupError:
+            await msg.edit(
+                f"🎥 <b>{title}</b>\n"
+                f"📊 {percent:.1f}% [{bar}]\n"
+                f"⏱ {elapsed}/{duration}s"
+            )
+        except Exception:
             pass
 
-    task.cancel()
+        await asyncio.sleep(5)
 
-    await event.reply("🛑 Stop request sent.")
+    active_processes.pop(chat_id, None)
 
+    await app.send_message(chat_id, "📤 Uploading...")
 
-# =========================================================
-# MAIN
-# =========================================================
+    last_recording[chat_id] = filename
 
-async def main():
-    await client.start(bot_token=BOT_TOKEN)
+    await upload_video(chat_id, filename)
 
-    me = await client.get_me()
-    logger.info("Bot started: @%s", me.username)
-
-    print("Bot is running...")
-
-    await client.run_until_disconnected()
+    await app.send_message(chat_id, "✅ Upload completed")
 
 
-if __name__ == "__main__":
-    asyncio.run(main())
+# ---------------- COMMANDS ----------------
+
+@app.on_message(filters.command("start"))
+async def start(_, m: Message):
+    await m.reply(
+        "🤖 IPTV Recorder Bot\n\n"
+        "/record <url> <duration> <title>\n"
+        "Example:\n"
+        "/record http://test.m3u8 00:05:00 Sony_HD"
+    )
+
+
+@app.on_message(filters.command("help"))
+async def help_cmd(_, m: Message):
+    await m.reply(
+        "/start\n"
+        "/help\n"
+        "/record <url> <duration> <title>\n"
+        "/cancel\n"
+        "/status\n"
+        "/addadmin <user_id>"
+    )
+
+
+@app.on_message(filters.command("record"))
+async def record(_, m: Message):
+    if not m.from_user or m.from_user.id not in approved_users:
+        return await m.reply("🚫 Not authorized")
+
+    try:
+        _, url, dur, title = m.text.split(" ", 3)
+    except Exception:
+        return await m.reply(
+            "❌ Usage: /record <url> <duration> <title>"
+        )
+
+    msg = await m.reply("🎬 Recording started...")
+
+    asyncio.create_task(
+        record_stream(m.chat.id, url, dur, title, msg)
+    )
+
+
+@app.on_message(filters.command("cancel"))
+async def cancel(_, m: Message):
+    p = active_processes.get(m.chat.id)
+
+    if p:
+        p.terminate()
+        active_processes.pop(m.chat.id, None)
+
+        await m.reply("🛑 Recording cancelled")
+    else:
+        await m.reply("No active recording")
+
+
+@app.on_message(filters.command("status"))
+async def status(_, m: Message):
+    await m.reply(
+        f"Recording Active: "
+        f"{'Yes' if m.chat.id in active_processes else 'No'}"
+    )
+
+
+@app.on_message(filters.command("addadmin"))
+async def addadmin(_, m: Message):
+    if not m.from_user or m.from_user.id != PERMANENT_ADMIN:
+        return
+
+    try:
+        uid = int(m.text.split(" ")[1])
+
+        approved_users.add(uid)
+
+        await m.reply(f"✅ Added {uid}")
+
+    except Exception:
+        await m.reply("❌ /addadmin <user_id>")
+
+
+# ---------------- RUN ----------------
+
+print("🤖 Pyrogram IPTV Recorder Bot Running")
+
+app.run()
