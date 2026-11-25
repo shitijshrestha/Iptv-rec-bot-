@@ -745,4 +745,4 @@ async def record_cmd(event):
             if time_to_seconds(split_duration) is None:
                 raise ValueError("Invalid split duration.")
 
-            del args[split_index:s
+            del args[split_index:split_index + 2]
